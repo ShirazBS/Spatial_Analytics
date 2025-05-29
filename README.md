@@ -16,10 +16,8 @@ The project was conducted in the desktop version of R (4.3.1) in RStudio (2023.0
 
 ### Setup
 First of all make sure to clone this repository to your device. 
-	```
-{
+```
 git clone https://github.com/ShirazBS/Spatial_Analytics.git
-}
 ```
 Then simply make sure to install the packages needed based on the list provided in the script, change your working directory, and add in your own MapBoxAPI token.
 
