@@ -1,0 +1,936 @@
+---
+title: "Spatial Analytics Analysis"
+author: "Shiraz Ben Shoshan"
+date: "2025-05-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir = 'set working directory here')
+```
+
+## this analysis starts by creating a shiny app for paris landmarks and hotels and then creates the same for copenhagen landmarks and hotels
+
+```{r}
+# # installing packages - make sure to install these if needed
+# install.packages("sf")
+# install.packages("osmdata")
+# install.packages("leaflet")
+# install.packages("units")
+# install.packages("tidyverse")
+# install.packages("mapboxapi")
+#install.packages("geosphere")
+#install.packages("rnaturalearth")
+```
+
+```{r}
+# loading the packages
+library(sf)
+library(osmdata)
+library(tidyverse)
+library(leaflet)
+library(units)
+library(dplyr)
+library(mapboxapi)
+library(shiny)
+library(readr)
+library(geosphere)
+library(ggplot2)
+library(scales)
+library(rnaturalearth)
+```
+
+# getting the paris landmarks ready
+```{r}
+# loading in pre-made geojson file with paris landmarks
+paris_landmarks <- st_read("paris-landmarks.geojson")
+
+# transforming the data to common CRS
+paris_landmarks <- st_transform(paris_landmarks, 3857)
+```
+
+```{r}
+# cleaning up paris landmarks df for later use 
+
+# transformation to CRS needed for mapboxapi
+paris_landmarks <- st_transform(paris_landmarks, 4326)
+
+# overwriting the df to include only the geometry
+paris_landmarks <- paris_landmarks %>% 
+  select(geometry)
+
+# finding central point for each landmark for analysis
+paris_landmark_points <- st_centroid(paris_landmarks)
+
+# printing to examine
+paris_landmark_points
+```
+
+```{r}
+# creating a list with the landmark names for later analysis
+paris_landmark_names <- c("Notre Dame Cathedral", "Jardin du Luxembourg", "Sacre-Coeur", "Jardin des Tuileries", "Louvre Museum",
+                    "Eiffel Tower", "Arc de Triumphe", "Palais Royal", "Pantheon", "Orsay Museum", "Palais Garnier",
+                    "Pont Alexandre III", "Les Invalids", "Champs-Elysees", "Place de la Concorde", "Sainte-Chapelle",
+                    "Moulin Rouge", "Pompidou Center", "Rodin Museum", "Pont Neuf")
+
+# overwriting the df to include landmark names
+paris_landmark_points <- paris_landmark_points %>% 
+  mutate(landmark_name = paris_landmark_names)
+```
+
+# getting the paris hotels ready
+```{r}
+# using OpenStreetMap for collecting hotels
+
+# define bounding box for Paris 
+bbox <- c(
+  min = 2.252,  # Western Paris
+  minlat = 48.816,
+  max = 2.422,  # Eastern Paris
+  maxlat = 48.902
+)
+
+# code to bypass internet issues
+assign("has_internet_via_proxy", TRUE, environment(curl::has_internet))
+
+# query hotels using Overpass API
+hotels_query <- opq(bbox = bbox) %>%
+  add_osm_feature(key = "tourism", value = "hotel") %>%
+  osmdata_sf()
+
+# extract hotel points
+paris_hotels <- hotels_query$osm_points %>%
+  st_transform(3857)  
+
+# clean missing geometry
+paris_hotels <- paris_hotels[!st_is_empty(paris_hotels), ]
+
+# cleaning out df to disregard NA values and ensure name of hotel is seen as character
+paris_hotels <- paris_hotels %>%
+  filter(!is.na(name)) %>%
+  mutate(label_name = as.character(name))
+```
+
+```{r}
+# cleaning the df to only contain necessary info and ensure long and lat coordinates are set up correctly
+paris_hotels_coords <- paris_hotels %>%
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) %>%
+  dplyr::select(name, osm_id, lon, lat)
+
+paris_hotels_coords
+```
+
+```{r}
+# setting seed to ensure replicability
+set.seed(123)  
+
+# sample 100 random rows from paris_hotels_coords since the df is too big (includes over 1,200 hotels)
+hotels_sample_100 <- paris_hotels_coords %>%
+  slice_sample(n = 100)
+```
+
+# calculating distance and walking time to between every hotel in the sample to every one of the defined 20 landmarks using mapboxapi
+
+```{r}
+# set token
+Sys.setenv(MAPBOX_ACCESS_TOKEN = "your access token goes here")
+
+# transform to WGS84
+paris_hotels_wgs <- st_transform(hotels_sample_100, 4326)
+paris_landmark_points_wgs <- st_transform(paris_landmark_points, 4326)
+
+# extract coords + names from transformed data
+final_paris_hotels <- paris_hotels_wgs %>%
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(name, lon, lat)
+
+# prepare coordinate matrices
+origins <- as.matrix(final_paris_hotels[, c("lon", "lat")])
+destinations <- as.matrix(st_coordinates(paris_landmark_points_wgs))
+
+# check that matrices are set up correctly
+stopifnot(ncol(origins) == 2, ncol(destinations) == 2)
+
+# convert to list of [lon, lat] pairs
+origins_list <- split(origins, seq(nrow(origins)))
+origins_list <- lapply(origins_list, as.numeric)
+
+destinations_list <- split(destinations, seq(nrow(destinations)))
+destinations_list <- lapply(destinations_list, as.numeric)
+
+# chunk size (5 origins per chunk to stay under 25 coordinate limit)
+chunk_size <- 5
+chunks <- split(origins_list, ceiling(seq_along(origins_list) / chunk_size))
+
+# initialize lists to collect results
+distances_list <- list()
+durations_list <- list()
+
+# loop through chunks to call Mapbox API safely
+for (i in seq_along(chunks)) {
+  cat("Processing chunk", i, "of", length(chunks), "\n")
+  
+  dist_chunk <- mb_matrix(
+    origins = chunks[[i]],
+    destinations = destinations_list,
+    profile = "walking",
+    access_token = Sys.getenv("MAPBOX_ACCESS_TOKEN"),
+    output = "distance"
+  )
+  
+  dur_chunk <- mb_matrix(
+    origins = chunks[[i]],
+    destinations = destinations_list,
+    profile = "walking",
+    access_token = Sys.getenv("MAPBOX_ACCESS_TOKEN"),
+    output = "duration"
+  )
+  
+  distances_list[[i]] <- dist_chunk
+  durations_list[[i]] <- dur_chunk
+}
+
+# combine all chunks into full matrices
+distances <- do.call(rbind, distances_list)
+durations <- do.call(rbind, durations_list)
+
+# build result table
+paris_hotel_landmark <- expand.grid(
+  hotel = final_paris_hotels$name,
+  landmark = paris_landmark_points$landmark_name
+)
+
+paris_hotel_landmark$distance_m <- as.vector(distances)
+paris_hotel_landmark$duration_m <- as.vector(durations)
+
+# view sample of result
+head(paris_hotel_landmark)
+```
+
+# saving data needed for shiny app
+
+```{r}
+write.csv(paris_hotel_landmark, "paris_hotel_landmark.csv", row.names = FALSE)
+saveRDS(paris_hotel_landmark, "paris_hotel_landmark.rds")
+write.csv(final_paris_hotels, "final_paris_hotels.csv", row.names = FALSE)
+saveRDS(paris_landmark_points, "paris_landmark_points.rds")
+```
+
+# creating shiny app
+
+```{r}
+# load data
+hotel_distances <- read_csv("paris_hotel_landmark.csv")
+hotel_coords <- read_csv("final_paris_hotels.csv")
+landmarks <- readRDS("paris_landmark_points.rds")  
+landmarks <- st_as_sf(landmarks)
+
+ui <- fluidPage(
+  titlePanel("Paris Hotels Near Landmarks"),
+  sidebarLayout(
+    sidebarPanel(
+      selectizeInput("landmarks", "Select Landmarks:", choices = NULL, multiple = TRUE),
+      sliderInput("max_distance", "Max Walking Distance (meters):", min = 0, max = 7000, value = 1000, step = 100)
+    ),
+    mainPanel(leafletOutput("map", height = 650))
+  )
+)
+
+server <- function(input, output, session) {
+  
+  # populate landmark choices
+  observe({
+    updateSelectizeInput(session, "landmarks",
+                         choices = sort(unique(landmarks$landmark_name)),
+                         selected = unique(landmarks$landmark_name)[1])
+  })
+  
+  # hotels that are within distance for all selected landmarks
+  selected_hotels <- reactive({
+    req(input$landmarks)
+    
+    filtered <- hotel_distances %>%
+      filter(landmark %in% input$landmarks, distance_m <= input$max_distance)
+    
+    hotel_counts <- filtered %>%
+      count(hotel) %>%
+      filter(n == length(input$landmarks))
+    
+    hotel_coords %>%
+      filter(name %in% hotel_counts$hotel) %>%
+      rename(hotel = name)
+  })
+  
+  # tooltip data: Distance and time for each landmark
+  hotel_tooltips <- reactive({
+    req(input$landmarks)
+    
+    hotel_distances %>%
+      filter(landmark %in% input$landmarks, distance_m <= input$max_distance) %>%
+      mutate(time_min = round(duration_m, 1))
+  })
+  
+  # landmark points to show on the map
+  selected_landmark_points <- reactive({
+    req(input$landmarks)
+    landmarks %>% filter(landmark_name %in% input$landmarks)
+  })
+  
+  # initial map
+  output$map <- renderLeaflet({
+    leaflet() %>%
+      addProviderTiles("CartoDB.Positron") %>%
+      setView(lng = 2.3522, lat = 48.8566, zoom = 12) %>%
+      addLayersControl(overlayGroups = c("Landmark Points", "Hotels"),
+                       options = layersControlOptions(collapsed = FALSE))
+  })
+  
+  # add landmark markers
+  observe({
+    leafletProxy("map") %>%
+      clearGroup("Landmark Points") %>%
+      addCircleMarkers(
+        data = selected_landmark_points(),
+        lng = ~st_coordinates(geometry)[,1],
+        lat = ~st_coordinates(geometry)[,2],
+        radius = 8,
+        color = "blue", fillColor = "lightblue", fillOpacity = 0.8,
+        group = "Landmark Points",
+        label = ~landmark_name
+      )
+  })
+  
+  # add hotel markers with distance and time info
+  observe({
+    leafletProxy("map") %>% clearGroup("Hotels")
+    
+    hotels <- selected_hotels()
+    details <- hotel_tooltips()
+    if (is.null(hotels) || nrow(hotels) == 0) return()
+    
+    hotel_tooltip_data <- hotels %>%
+      left_join(details, by = "hotel") %>%
+      group_by(hotel, lat, lon) %>%
+      summarise(
+        popup = paste0(
+          "<b>", hotel, "</b><br/>",
+          paste0(
+            landmark, ": distance ", round(distance_m), " m, time: ", round(duration_m, 1), " min",
+            collapse = "<br/>"
+          )
+        ),
+        .groups = "drop"
+      )
+    
+    leafletProxy("map") %>%
+      addCircleMarkers(
+        data = hotel_tooltip_data,
+        lng = ~lon,
+        lat = ~lat,
+        radius = 5,
+        color = "red", fillOpacity = 0.7,
+        group = "Hotels",
+        label = lapply(hotel_tooltip_data$popup, HTML),
+        popup = ~popup
+      )
+  })
+}
+
+shinyApp(ui, server)
+```
+
+# repeating workflow for copenhagen landmarks and hotels
+
+```{r}
+# loading in copenhagen landmarks 
+copenhagen_landmarks <- st_read("copenhagen-landmarks.geojson")  
+
+# transforming the data to common CRS 
+copenhagen_landmarks <- st_transform(copenhagen_landmarks, 3857)
+```
+
+```{r}
+# transformation to CRS needed for mapboxapi
+copenhagen_landmarks <- st_transform(copenhagen_landmarks, 4326)
+
+# overwriting the df to include only geometry information
+copenhagen_landmarks <- copenhagen_landmarks %>% 
+  select(geometry)
+
+# finding central point for each landmark for analysis
+cph_landmark_points <- st_centroid(copenhagen_landmarks)
+
+print(cph_landmark_points)
+```
+
+# adding landmark names for analysis purposes
+
+```{r}
+# adding columns with landmark names for cph 
+cph_landmark_names <- c("Tivoli Gardens", "Nyhavn", "Amalienborg", "Strøget", "Rundetaarn", "Rosenborg Slot", "Den Lille Havfrue", "Christiansborg Slot", "Frederiksberg Slot", "Gråbrødretorv", "Kongens Nytorv", "Frederiks Kirke", "Vor Frelsers Kirke", "Ny Carlsberg Glyptotek", "Peblinge Sø", "Kastellet", "Christiania", "Nordhavn", "The Royal Library", "Nationalmuseet")
+
+# overwriting df with the landmark names
+cph_landmark_points <- cph_landmark_points %>% 
+  mutate(cph_landmark_name = cph_landmark_names)
+```
+
+# getting the copenhagen hotels ready
+
+```{r}
+# getting cph hotels from open street map
+
+# define bounding box for Copenhagen
+bbox <- c(
+  min = 12.55,    # Western Copenhagen
+  minlat = 55.60, # Southern Copenhagen
+  max = 12.65,    # Eastern Copenhagen
+  maxlat = 55.70  # Northern Copenhagen
+)
+
+assign("has_internet_via_proxy", TRUE, environment(curl::has_internet))
+
+# query hotels using Overpass API
+hotels_query <- opq(bbox = bbox) %>%
+  add_osm_feature(key = "tourism", value = "hotel") %>%
+  osmdata_sf()
+
+# extract hotel points
+copenhagen_hotels <- hotels_query$osm_points %>%
+  st_transform(3857)  
+
+# clean missing geometry
+copenhagen_hotels <- copenhagen_hotels[!st_is_empty(copenhagen_hotels), ]
+
+copenhagen_hotels <- copenhagen_hotels %>%
+  filter(!is.na(name)) %>%
+  mutate(label_name = as.character(name))
+```
+
+```{r}
+# cleaning the df and preparing the long lat coordinates accordingly
+cph_hotels_coords <- copenhagen_hotels %>%
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) %>%
+  dplyr::select(name, osm_id, lon, lat)
+
+cph_hotels_coords
+```
+
+# calculating the distance and walking time between each hotel in list and every landmark (20 in total) using mapboxapi
+
+```{r}
+# set Mapbox token
+Sys.setenv(MAPBOX_ACCESS_TOKEN = "your access token goes here")
+
+# transform to WGS84 (lat/lon for Mapbox)
+cph_hotels_wgs <- st_transform(cph_hotels_coords, 4326)
+cph_landmarks_wgs <- st_transform(cph_landmark_points, 4326)
+
+# extract coordinates + names (drop geometry to avoid issues)
+final_cph_hotels <- cph_hotels_wgs %>%
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(name, lon, lat)
+
+# prepare coordinate matrices
+origins <- as.matrix(final_cph_hotels[, c("lon", "lat")])
+destinations <- as.matrix(st_coordinates(cph_landmarks_wgs))
+
+# confirm dimensions
+stopifnot(ncol(origins) == 2, ncol(destinations) == 2)
+
+# convert to list of [lon, lat] pairs
+origins_list <- split(origins, seq(nrow(origins)))
+origins_list <- lapply(origins_list, as.numeric)
+
+destinations_list <- split(destinations, seq(nrow(destinations)))
+destinations_list <- lapply(destinations_list, as.numeric)
+
+# set chunk size (max 25 coords per Mapbox Matrix request)
+chunk_size <- 5
+chunks <- split(origins_list, ceiling(seq_along(origins_list) / chunk_size))
+
+# initialize lists to store results
+distances_list <- list()
+durations_list <- list()
+
+# loop through chunks to get distances and durations
+for (i in seq_along(chunks)) {
+  cat("Processing chunk", i, "of", length(chunks), "\n")
+
+  dist_chunk <- mb_matrix(
+    origins = chunks[[i]],
+    destinations = destinations_list,
+    profile = "walking",
+    access_token = Sys.getenv("MAPBOX_ACCESS_TOKEN"),
+    output = "distance"
+  )
+
+  dur_chunk <- mb_matrix(
+    origins = chunks[[i]],
+    destinations = destinations_list,
+    profile = "walking",
+    access_token = Sys.getenv("MAPBOX_ACCESS_TOKEN"),
+    output = "duration"
+  )
+
+  distances_list[[i]] <- dist_chunk
+  durations_list[[i]] <- dur_chunk
+}
+
+# combine chunks into full matrices
+distances <- do.call(rbind, distances_list)
+durations <- do.call(rbind, durations_list)
+
+# build result table for Copenhagen
+cph_hotel_landmark <- expand.grid(
+  hotel = final_cph_hotels$name,
+  landmark = cph_landmark_points$cph_landmark_name
+)
+
+cph_hotel_landmark$distance_m <- as.vector(distances)
+cph_hotel_landmark$duration_m <- as.vector(durations)
+
+# view result
+head(cph_hotel_landmark)
+```
+
+# saving data for shiny app
+
+```{r}
+write.csv(cph_hotel_landmark, "cph_hotel_landmark.csv", row.names = FALSE)
+saveRDS(cph_hotel_landmark, "cph_hotel_landmark.rds")
+saveRDS(cph_landmark_points, "cph_landmark_points.rds")
+
+# extra measures for copenhagen hotel df 
+
+# making sure they are in WGS84
+cph_hotels_sf <- st_transform(cph_hotels_coords, 4326)  
+
+# get lat/lon in plain data frame
+cph_hotels_coords <- cph_hotels_sf %>%
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) %>%
+  st_drop_geometry()
+
+# save df
+write.csv(cph_hotels_coords, "cph_hotels_coords.csv", row.names = FALSE)
+```
+
+# creating shiny app
+
+```{r}
+# load copenhagen data
+hotel_distances <- read_csv("cph_hotel_landmark.csv")
+hotel_coords <- read_csv("cph_hotels_coords.csv")
+landmarks <- readRDS("cph_landmark_points.rds")
+landmarks <- st_as_sf(landmarks)
+
+ui <- fluidPage(
+  titlePanel("Copenhagen Hotels Near Landmarks"),
+  sidebarLayout(
+    sidebarPanel(
+      selectizeInput("landmarks", "Select Landmarks:", choices = NULL, multiple = TRUE),
+      sliderInput("max_distance", "Max Walking Distance (meters):", min = 0, max = 7000, value = 1000, step = 100)
+    ),
+    mainPanel(leafletOutput("map", height = 650))
+  )
+)
+
+server <- function(input, output, session) {
+  
+  # populate landmark choices
+  observe({
+    updateSelectizeInput(session, "landmarks",
+                         choices = sort(unique(landmarks$cph_landmark_name)),
+                         selected = unique(landmarks$cph_landmark_name)[1])
+  })
+  
+  # hotels that are within distance for all selected landmarks
+  selected_hotels <- reactive({
+    req(input$landmarks)
+    
+    filtered <- hotel_distances %>%
+      filter(landmark %in% input$landmarks, distance_m <= input$max_distance)
+    
+    hotel_counts <- filtered %>%
+      count(hotel) %>%
+      filter(n == length(input$landmarks))
+    
+    hotel_coords %>%
+      filter(name %in% hotel_counts$hotel) %>%
+      rename(hotel = name)
+  })
+  
+  # tooltip data: Distance and time for each landmark
+  hotel_tooltips <- reactive({
+    req(input$landmarks)
+    
+    hotel_distances %>%
+      filter(landmark %in% input$landmarks, distance_m <= input$max_distance) %>%
+      mutate(time_min = round(duration_m, 1))
+  })
+  
+  # landmark points to show on the map
+  selected_landmark_points <- reactive({
+    req(input$landmarks)
+    landmarks %>% filter(cph_landmark_name %in% input$landmarks)
+  })
+  
+  # initial map (centered on Copenhagen)
+  output$map <- renderLeaflet({
+    leaflet() %>%
+      addProviderTiles("CartoDB.Positron") %>%
+      setView(lng = 12.5683, lat = 55.6761, zoom = 13) %>%
+      addLayersControl(overlayGroups = c("Landmark Points", "Hotels"),
+                       options = layersControlOptions(collapsed = FALSE))
+  })
+  
+  # add landmark markers
+  observe({
+    leafletProxy("map") %>%
+      clearGroup("Landmark Points") %>%
+      addCircleMarkers(
+        data = selected_landmark_points(),
+        lng = ~st_coordinates(geometry)[,1],
+        lat = ~st_coordinates(geometry)[,2],
+        radius = 8,
+        color = "blue", fillColor = "lightblue", fillOpacity = 0.8,
+        group = "Landmark Points",
+        label = ~cph_landmark_name
+      )
+  })
+  
+  # add hotel markers with distance and time info
+  observe({
+    leafletProxy("map") %>% clearGroup("Hotels")
+    
+    hotels <- selected_hotels()
+    details <- hotel_tooltips()
+    if (is.null(hotels) || nrow(hotels) == 0) return()
+    
+    hotel_tooltip_data <- hotels %>%
+      left_join(details, by = "hotel") %>%
+      group_by(hotel, lat, lon) %>%
+      summarise(
+        popup = paste0(
+          "<b>", hotel, "</b><br/>",
+          paste0(
+            landmark, ": distance ", round(distance_m), " m, time: ", round(duration_m, 1), " min",
+            collapse = "<br/>"
+          )
+        ),
+        .groups = "drop"
+      )
+    
+    leafletProxy("map") %>%
+      addCircleMarkers(
+        data = hotel_tooltip_data,
+        lng = ~lon,
+        lat = ~lat,
+        radius = 5,
+        color = "red", fillOpacity = 0.7,
+        group = "Hotels",
+        label = lapply(hotel_tooltip_data$popup, HTML),
+        popup = ~popup
+      )
+  })
+}
+
+shinyApp(ui, server)
+```
+
+
+# analyses to compare and contrast
+
+# comparing average walking distances to landmarks
+```{r}
+# copenhagen stats
+cph_distance_stats <- cph_hotel_landmark %>%
+  summarise(
+    mean_distance = mean(distance_m, na.rm = TRUE),
+    median_distance = median(distance_m, na.rm = TRUE)
+  )
+
+# paris stats
+paris_distance_stats <- paris_hotel_landmark %>%
+  summarise(
+    mean_distance = mean(distance_m, na.rm = TRUE),
+    median_distance = median(distance_m, na.rm = TRUE)
+  )
+
+# combine for comparison
+distance_comparison <- bind_rows(
+  cph_distance_stats %>% mutate(city = "Copenhagen"),
+  paris_distance_stats %>% mutate(city = "Paris")
+)
+
+print(distance_comparison)
+```
+
+The analysis reveals that Copenhagen hotels are generally closer to their landmarks compared to Paris. The mean walking distance from hotels to landmarks in Copenhagen is approximately 2,504 meters, while in Paris it is 3,717 meters. Similarly, the median distance is 2,046 meters for Copenhagen and 3,513 meters for Paris. This suggests that Copenhagen offers more centralized access to landmarks, potentially making it easier for tourists to explore the city on foot. In contrast, Paris landmarks appear to be more dispersed or hotels may be more spread out, resulting in longer walking distances overall.
+
+# analyzing landmark spatial spread
+
+```{r}
+# extract coordinates in lon-lat for each city
+cph_coords <- st_coordinates(st_transform(cph_landmark_points, 4326))
+paris_coords <- st_coordinates(st_transform(paris_landmark_points, 4326))
+
+# function to calculate average pairwise distance (meters)
+avg_pairwise_dist <- function(coords_matrix) {
+  # Calculate all pairwise distances
+  dist_matrix <- distm(coords_matrix, fun = distHaversine)
+  
+  # remove diagonal and lower triangle (distance to self = 0)
+  dist_values <- dist_matrix[upper.tri(dist_matrix)]
+  
+  # summary stats
+  list(
+    mean = mean(dist_values),
+    median = median(dist_values),
+    max = max(dist_values)
+  )
+}
+
+# calculate for Copenhagen
+cph_dispersion <- avg_pairwise_dist(cph_coords)
+
+# calculate for Paris
+paris_dispersion <- avg_pairwise_dist(paris_coords)
+
+# combine results
+dispersion_comparison <- data.frame(
+  city = c("Copenhagen", "Paris"),
+  mean_pairwise_distance_m = c(cph_dispersion$mean, paris_dispersion$mean),
+  median_pairwise_distance_m = c(cph_dispersion$median, paris_dispersion$median),
+  max_pairwise_distance_m = c(cph_dispersion$max, paris_dispersion$max)
+)
+
+print(dispersion_comparison)
+```
+
+The data shows that Paris landmarks are more widely dispersed than those in Copenhagen. Paris has a higher average pairwise distance between landmarks (≈ 2,229 m) compared to Copenhagen (≈ 1,682 m), and the median distance is also greater (2,113 m vs. 1,370 m). This suggests that Paris landmarks are spread over a broader area, potentially requiring more travel between points of interest. Interestingly, however, Copenhagen has a higher maximum pairwise distance (≈ 5,874 m vs. Paris’ 4,841 m), indicating that while Copenhagen’s landmarks are generally more clustered, there are a few that are significantly farther out.
+
+# analyzing hotel to landmark pairs within 1,000 meters
+```{r}
+# set your distance threshold (e.g., 1000 meters)
+max_distance <- 1000
+
+# filter hotel-landmark pairs within max_distance
+hotels_near_landmarks <- cph_hotel_landmark %>%
+  filter(distance_m <= max_distance)
+
+# count hotels per landmark
+hotel_counts_per_landmark <- hotels_near_landmarks %>%
+  group_by(cph_landmark_name = landmark) %>%
+  summarise(hotel_count = n_distinct(hotel)) %>%
+  arrange(desc(hotel_count))
+
+# join counts back to landmark geometry
+landmarks_with_counts <- cph_landmark_points %>%
+  left_join(hotel_counts_per_landmark, by = c("cph_landmark_name" = "cph_landmark_name"))
+
+# replace NA hotel counts with 0
+landmarks_with_counts$hotel_count[is.na(landmarks_with_counts$hotel_count)] <- 0
+
+# create color palette for dynamic red shading
+pal <- colorNumeric(
+  palette = c("#FFC8C8", "#FF8A8A", "#FF5252", "#CC1F1F", "#800000"),
+  domain = landmarks_with_counts$hotel_count
+)
+
+# create leaflet map with shaded markers
+leaflet(landmarks_with_counts) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircleMarkers(
+    radius = ~rescale(hotel_count, to = c(5, 20)),
+    color = ~pal(hotel_count),
+    fillColor = ~pal(hotel_count),
+    fillOpacity = 0.8,
+    stroke = FALSE,
+    label = ~paste0(cph_landmark_name, ": ", hotel_count, " hotels")
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = pal,
+    values = landmarks_with_counts$hotel_count,
+    title = "Hotels per Landmark",
+    opacity = 1
+  ) %>%
+  addControl(
+  html = "<div style='font-size:18px; font-weight:bold; padding:5px;'>Number of Hotels within 1,000 Meters of Landmark - Copenhagen</div>",
+    position = "topright"
+  )
+```
+
+```{r}
+
+max_distance <- 1000
+
+# filter hotel-landmark pairs within max_distance
+hotels_near_landmarks <- paris_hotel_landmark %>%
+  filter(distance_m <= max_distance)
+
+# count hotels per landmark
+hotel_counts_per_landmark <- hotels_near_landmarks %>%
+  group_by(landmark) %>%
+  summarise(hotel_count = n_distinct(hotel)) %>%
+  arrange(desc(hotel_count))
+
+# join counts back to landmark geometry (assuming landmark_points is an sf object with geometry and landmark_name)
+landmarks_with_counts <- paris_landmark_points %>%
+  left_join(hotel_counts_per_landmark, by = c("landmark_name" = "landmark"))
+
+# replace NA hotel counts with 0
+landmarks_with_counts$hotel_count[is.na(landmarks_with_counts$hotel_count)] <- 0
+
+# create color palette for dynamic red shading (5 shades of red, darkest = most hotels)
+pal <- colorNumeric(
+  palette = c("#FFC8C8", "#FF8A8A", "#FF5252", "#CC1F1F", "#800000"),
+  domain = landmarks_with_counts$hotel_count
+)
+
+# create leaflet map with shaded markers
+leaflet(landmarks_with_counts) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircleMarkers(
+    radius = ~rescale(hotel_count, to = c(5, 20)),
+    color = ~pal(hotel_count),
+    fillColor = ~pal(hotel_count),
+    fillOpacity = 0.8,
+    stroke = FALSE,
+    label = ~paste0(landmark_name, ": ", hotel_count, " hotels")
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = pal,
+    values = landmarks_with_counts$hotel_count,
+    title = "Hotels per Landmark",
+    opacity = 1
+  ) %>%
+  addControl(
+  html = "<div style='font-size:18px; font-weight:bold; padding:5px;'>Number of Hotels within 1,000 Meters of Landmark - Paris</div>",
+    position = "topright"
+  )
+```
+
+# finding shortest route in copenhagen and paris to compare
+```{r}
+# find the shortest route in Copenhagen
+shortest_cph <- cph_hotel_landmark %>%
+  summarise(
+    min_distance_m = min(distance_m, na.rm = TRUE),
+    closest_hotel = hotel[which.min(distance_m)],
+    closest_landmark = landmark[which.min(distance_m)]
+  )
+
+# find the shortest route in Paris
+shortest_paris <- paris_hotel_landmark %>%
+  summarise(
+    min_distance_m = min(distance_m, na.rm = TRUE),
+    closest_hotel = hotel[which.min(distance_m)],
+    closest_landmark = landmark[which.min(distance_m)]
+  )
+
+shortest_cph
+shortest_paris
+```
+
+# finding how many hotels are within 7km radius of all landmarks
+```{r}
+# define threshold
+threshold <- 5000  # meters
+
+# copenhagen
+# Get number of unique landmarks
+cph_n_landmarks <- cph_hotel_landmark %>% pull(landmark) %>% unique() %>% length()
+
+# find hotels within 7 km of all landmarks
+cph_hotels_within_all <- cph_hotel_landmark %>%
+  filter(distance_m <= threshold) %>%
+  group_by(hotel) %>%
+  summarise(n_within_range = n_distinct(landmark)) %>%
+  filter(n_within_range == cph_n_landmarks)
+
+# view results
+cph_hotels_within_all
+
+# Paris
+# get number of unique landmarks
+prs_n_landmarks <- paris_hotel_landmark %>% pull(landmark) %>% unique() %>% length()
+
+# find hotels within 7 km of all landmarks
+prs_hotels_within_all <- paris_hotel_landmark %>%
+  filter(distance_m <= threshold) %>%
+  group_by(hotel) %>%
+  summarise(n_within_range = n_distinct(landmark)) %>%
+  filter(n_within_range == prs_n_landmarks)
+
+# view results
+prs_hotels_within_all
+
+```
+
+# hotels within 3 km of half the landmarks chosen at random
+```{r}
+
+set.seed(42)  # for reproducibility
+
+# Copenhagen
+# sample half the landmarks
+c_landmarks_all <- unique(cph_hotel_landmark$landmark)
+c_n_half <- floor(length(c_landmarks_all) / 2)
+c_landmarks_sampled <- sample(c_landmarks_all, c_n_half)
+
+# filter for only those sampled landmarks
+cph_df_filtered <- cph_hotel_landmark %>%
+  filter(landmark %in% c_landmarks_sampled)
+
+# find hotels within 3 km of each sampled landmark
+c_hotels_close <- cph_df_filtered %>%
+  filter(distance_m <= 3000) %>%
+  group_by(hotel) %>%
+  summarise(n_within_range = n_distinct(landmark)) %>%
+  filter(n_within_range >= c_n_half)
+
+# view result
+c_hotels_close
+
+# Paris
+# sample half the landmarks
+p_landmarks_all <- unique(paris_hotel_landmark$landmark)
+p_n_half <- floor(length(p_landmarks_all) / 2)
+p_landmarks_sampled <- sample(p_landmarks_all, p_n_half)
+
+# filter for only those sampled landmarks
+paris_df_filtered <- paris_hotel_landmark %>%
+  filter(landmark %in% p_landmarks_sampled)
+
+# find hotels within 3 km of each sampled landmark
+p_hotels_close <- paris_df_filtered %>%
+  filter(distance_m <= 3000) %>%
+  group_by(hotel) %>%
+  summarise(n_within_range = n_distinct(landmark)) %>%
+  filter(n_within_range >= p_n_half)
+
+# view result
+p_hotels_close
+
+```
